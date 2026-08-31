@@ -46,12 +46,15 @@ class ReadTools:
     risk = Risk.LOW
 
     def __init__(self, store: Store, today: date | None = None,
-                 policy_retriever=None):
+                 policy_retriever=None, forecast_client=None):
         self.store = store
         self.today = today or date.today()
         # 정책 조회는 RAG-Marketing 의 검색 코어를 재사용한다.
         # 주입하지 않으면 지연 생성한다(색인 비용을 필요할 때만 낸다).
         self._policy_retriever = policy_retriever
+        # 수요 예측은 별도 서비스(ML-Product)에 있다. 같은 지연 생성 패턴 —
+        # 예측을 안 쓰는 상담 경로에서 HTTP 클라이언트를 만들 이유가 없다.
+        self._forecast_client = forecast_client
 
     def get_booking(self, booking_id: str) -> ToolResult:
         b = self.store.get_booking(booking_id)
@@ -95,6 +98,31 @@ class ReadTools:
             "tiers": pol.tiers,
             "retrieval_score": round(found.top_score, 6),
         })
+
+    @property
+    def forecast_client(self):
+        if self._forecast_client is None:
+            from app.agent.forecast import ForecastClient
+            self._forecast_client = ForecastClient()
+        return self._forecast_client
+
+    def get_market_demand(self, region: str | None = None) -> ToolResult:
+        """시장 수요 조회 — **예측과 그 오차를 함께 가져온다.**
+
+        서비스에 못 닿으면 빈 목록이 아니라 실패를 돌려준다. 빈 목록으로
+        내려보내면 하류가 "이 시장에 수요가 없다" 로 읽고 그 판단으로 영업
+        대상을 지운다 — 서비스가 잠깐 죽은 것과 시장이 죽은 것은 다르다.
+        """
+        from app.agent.forecast import ForecastUnavailable
+        try:
+            payload = self.forecast_client.market_demand(region=region)
+        except ForecastUnavailable as e:
+            return ToolResult(False, {}, str(e))
+
+        if not payload["rows"]:
+            return ToolResult(False, {"count": 0},
+                              "예측 행이 비어 있다 — 조회 조건을 확인해야 한다")
+        return ToolResult(True, payload)
 
     def calculate_refund(self, booking_id: str) -> ToolResult:
         """환불 금액 계산. 안내만 하며 상태를 바꾸지 않는다."""
@@ -182,6 +210,7 @@ TOOL_REGISTRY = {
     "get_booking": Risk.LOW,
     "get_property": Risk.LOW,
     "get_cancellation_policy": Risk.LOW,
+    "get_market_demand": Risk.LOW,
     "calculate_refund": Risk.MEDIUM,
     "cancel_and_refund": Risk.HIGH,
 }
